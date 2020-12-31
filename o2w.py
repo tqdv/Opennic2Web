@@ -11,7 +11,7 @@ class struct: pass
 config = struct()
 config.hostname = b"localhost"
 
-logging.basicConfig(level = logging.DEBUG)
+logging.basicConfig(level = logging.DEBUG, format = '%(levelname)s %(filename)s:%(lineno)d %(message)s')
 
 # TODO use twisted endpoints cf. <https://twistedmatrix.com/documents/current/core/howto/endpoints.html>
 reactor.listenTCP(8080, Opennic2WebFactory(config=config))

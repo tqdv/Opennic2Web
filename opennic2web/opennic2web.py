@@ -10,25 +10,124 @@ import logging
 from .util import remove_suffix
 
 from twisted.web import http, proxy
-from twisted.internet import reactor
+from twisted.web.http_headers import Headers
+from twisted.internet import reactor, protocol
+
+OPENNIC_TLDS = b"bbs chan cyb dyn epic geek gopher indy libre neo null o oss oz parody pirate".split()
 
 # Inspired by twisted.web.proxy and Tor2Web
 # cf. <https://twistedmatrix.com/documents/current/api/twisted.web.proxy.html>
+# We don't subclass proxy.* as it hides control flow and it harder to work with
 
-# TODO why does Tor2Web subclass http.Client instead ?
-class Opennic2WebClient(proxy.ProxyClient):
+# TODO add banner
+# TODO why does Tor2Web subclass client.Agent instead ?
+class Opennic2WebClient(http.HTTPClient):
     """
     Our outgoing client ie. HTTP client
+
+    It copies headers and transfers data from the server to the client.
+
+    @ivar _finished: A flag which indicates whether or not the original request
+        has been finished yet.
     """
-    pass
+    _finished = False
+
+    def __init__(self, command, uri, _version, headers, data, proxy_request):
+        """
+        @param headers: The headers the client sends to the server
+        @type headers: a L{Headers} object
+        """
+
+        self.proxy_request = proxy_request
+        self.responseHeaders = proxy_request.responseHeaders
+        self.command = command
+        self.uri = uri
+
+        # Remove connection specific headers
+        headers.removeHeader(b'connection')
+        headers.removeHeader(b'keep-alive')
+
+        self.headers = headers
+        self.data = data
 
 
-class Opennic2WebClientFactory(proxy.ProxyClientFactory):
-    """
-    Our ClientFactory to handle Requests.
-    """
+    def connectionMade(self):
+        """
+        Send the HTTP request after the connection is established
+        """
+        self.sendCommand(self.command, self.uri)
+        for header, values in self.headers.getAllRawHeaders():
+            for v in values:
+                self.sendHeader(header, v)
+        self.endHeaders()
+        self.transport.write(self.data)
+
+    def handleStatus(self, version, code, message):
+        """
+        Copy HTTP status code to the original proxy request
+        """
+        self.proxy_request.setResponseCode(int(code), message)
+
+
+    def handleHeader(self, key, value):
+        """
+        Copy received headers to the original proxy Request
+        """
+        self.responseHeaders.addRawHeader(key, value)
     
+    def handleEndHeaders(self):
+        """
+        Add custom headers after the server is done with theirs
+        """
+        self.responseHeaders.addRawHeader(b'via', b'Opennic2Web')
+
+    def handleResponsePart(self, buffer):
+        """
+        Progressively write response back to the original proxy request client
+        """
+        self.proxy_request.write(buffer)
+
+    def handleResponseEnd(self):
+        """
+        Finish the original request, indicating that the response has been
+        completely written to it, and disconnect the outgoing transport.
+        """
+        if not self._finished:
+            self._finished = True
+            self.proxy_request.finish()
+            self.transport.loseConnection()
+
+
+class Opennic2WebClientFactory(protocol.ClientFactory):
+    """
+    Our ClientFactory to handle Requests. We mostly copy constructor variables.
+    """
+
     protocol = Opennic2WebClient
+
+    def __init__(self, command, uri, version, headers, data, proxy_request):
+        self.proxy_request = proxy_request
+        self.command = command
+        self.uri = uri
+        self.version = version
+        self.headers = headers
+        self.data = data
+
+    def buildProtocol(self, addr):
+        return self.protocol(
+            self.command, self.uri, self.version,
+            self.headers, self.data, self.proxy_request
+        )
+
+    def clientConnectionFailed(self, connector, reason):
+        """
+        Report a connection failure in a response to the incoming request as
+        an error.
+        """
+        self.proxy_request.setResponseCode(501, b"Gateway error")
+        self.proxy_request.responseHeaders.addRawHeader(b"Content-Type", b"text/html")
+        self.proxy_request.write(b"<H1>Could not connect</H1>")
+        self.proxy_request.finish()
 
 
 class Opennic2WebRequest(http.Request):
@@ -45,38 +144,58 @@ class Opennic2WebRequest(http.Request):
     ports = {b'http': 80}
 
     def __init__(self, channel, queued=http._QUEUED_SENTINEL, reactor=reactor):
-        super().__init__(channel)
+        super().__init__(channel, queued)
         self.reactor = reactor
         self.config = channel.config
 
+    # TODO handle user@passwd:domain.tld properly
     def process(self):
-        protocol = self.getProtocol()
-        # TODO handle case where the hostname is invalid eg there is no subdomain
-        # TODO Do we always remove the trailing dot ? eg. example.com. vs. example.com
-        host = remove_suffix(self.getRequestHostname(), b'.' + self.config.hostname)
+        host = self.getRequestHostname()
+        host = remove_suffix(host, self.config.hostname)
+        host = remove_suffix(host, b'.')
+
+        if not host:
+            # No subdomain requested
+            todo() 
+            self.finish()
+            return
+
+        try:
+            tld = host.rsplit(b'.', 1)[1]
+        except:
+            # TLD directly requested
+            todo()
+            self.finish()
+            return
+        
+        protocol = b'https' if self.isSecure() else b'http'
         port = self.ports[protocol]
-        # TODO handle custom ports
+        # TODO handle custom ports somehow
+        
+        if tld not in OPENNIC_TLDS:
+            # (Permanently) redirect to the normal url
+            # self.setResponseCode(http.MOVED_PERMANENTLY)
+            self.setResponseCode(http.FOUND)
+            port_bytes = b':%d' % port if port != self.ports[protocol] else b''
+            url = b''.join([protocol, b'://', host, port_bytes, self.uri])
+            self.setHeader(b"location", url)
+            self.finish()
+            return
 
-        assert (protocol and host), "Strings are not empty"
-
-        # TODO T2W had a .copy() here, is it needed ?
-        headers = self.getAllHeaders() # returns lowercased header keys 
-        headers[b'host'] = host
+        # Rewrite headers
+        headers = self.requestHeaders.copy()
+        headers.setRawHeaders(b'host', [host])
+        headers.addRawHeader(b'via', b'Opennic2Web')
 
         self.content.seek(0, 0)
+        data = self.content.read()
 
-        # TODO understand
         clientFactory = self.protocols[protocol](
-            self.method, self.uri, self.clientproto, headers, self.content.read(), self
+            self.method, self.uri, self.clientproto,
+            headers, data, self
         )
-
         self.reactor.connectTCP(host, port, clientFactory)
-    
-    def getProtocol(self):
-        """
-        Returns the request protocol as a byte string
-        """
-        return b'https' if self.isSecure() else b'http'
+        # The client will call .finish() for us
 
 
 # TODO look into http._GenericHTTPChannelProtocol to automatically switch on HTTP2
