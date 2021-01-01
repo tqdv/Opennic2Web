@@ -3,11 +3,21 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright © 2021 Tilwa Qendov
 
+# TODO add banner
+# TODO redirect to the actual OpenNIC domain with Javascript
+# TODO check if the client is a crawler
+# TODO gzip responses if we can (on certain mimetypes ?)
+# TODO maybe add stats
+# TODO prevent hotlinking
+# TODO add blocklist
+# TODO recommend DNS over TLS or DNS over HTTPS
+
 # Debugging
 from pprint import pprint as pp
 import logging
 
 from .util import remove_suffix
+from .config import Config
 
 from twisted.web import http, proxy
 from twisted.web.http_headers import Headers
@@ -19,13 +29,12 @@ OPENNIC_TLDS = b"bbs chan cyb dyn epic geek gopher indy libre neo null o oss oz 
 # cf. <https://twistedmatrix.com/documents/current/api/twisted.web.proxy.html>
 # We don't subclass proxy.* as it hides control flow and it harder to work with
 
-# TODO add banner
 # TODO why does Tor2Web subclass client.Agent instead ?
 class Opennic2WebClient(http.HTTPClient):
     """
     Our outgoing client ie. HTTP client
 
-    It copies headers and transfers data from the server to the client.
+    It naively copies headers and transfers data from the server to the client, without looking at it.
 
     @ivar _finished: A flag which indicates whether or not the original request
         has been finished yet.
@@ -87,6 +96,7 @@ class Opennic2WebClient(http.HTTPClient):
         """
         self.proxy_request.write(buffer)
 
+    # This function can be called multiple times cf. twisted doc, hence the instance state variable _finished
     def handleResponseEnd(self):
         """
         Finish the original request, indicating that the response has been
@@ -119,6 +129,7 @@ class Opennic2WebClientFactory(protocol.ClientFactory):
             self.headers, self.data, self.proxy_request
         )
 
+    # TODO templatize
     def clientConnectionFailed(self, connector, reason):
         """
         Report a connection failure in a response to the incoming request as
@@ -128,6 +139,49 @@ class Opennic2WebClientFactory(protocol.ClientFactory):
         self.proxy_request.responseHeaders.addRawHeader(b"Content-Type", b"text/html")
         self.proxy_request.write(b"<H1>Could not connect</H1>")
         self.proxy_request.finish()
+
+# TODO move in another file
+def parse_o2w_hostname(host, config):
+    """
+    Parse the hostname into the target domain, subdomains, tld, and port.
+
+    If the port is not present, it is set to None.
+    If domain, subdomains or tld are not present, they are set to the empty byte string.
+    """
+    def last_or_none(l):
+        try:
+            return l[-1]
+        except:
+            return None
+    
+    (tld, port) = (b'', None)
+    
+    host = remove_suffix(host, config.hostname)
+    host = remove_suffix(host, b'.')
+    
+    parts = host.rsplit(b'.', 2)
+
+    label = last_or_none(parts) # The last element in parts or None
+
+    # Parse *.<port>.opennic2web
+    if label is not None and label.isdigit():
+        maybe_port = int(label)
+        if maybe_port <= 65535:
+            port = maybe_port
+            parts.pop()
+            label = last_or_none(parts)
+    
+    # Copy domain before we parse the tld
+    domain = b'.'.join(parts)
+
+    # Parse *.<tld>.opennic2web
+    if label is not None:
+        tld = label
+        parts.pop()
+    
+    subdomains = b'.'.join(parts)
+    
+    return (domain, subdomains, tld, port)
 
 
 class Opennic2WebRequest(http.Request):
@@ -150,51 +204,56 @@ class Opennic2WebRequest(http.Request):
 
     # TODO handle user@passwd:domain.tld properly
     def process(self):
-        host = self.getRequestHostname()
-        host = remove_suffix(host, self.config.hostname)
-        host = remove_suffix(host, b'.')
+        """
+        Handle the request by either proxying the request to the requested OpenNIC domain, or our
+        own error message
+        """
+        (domain, subdomains, tld, port) = parse_o2w_hostname(self.getRequestHostname(), self.config)
 
-        if not host:
+        if not domain:
             # No subdomain requested
-            todo() 
+            todo()
             self.finish()
             return
 
-        try:
-            tld = host.rsplit(b'.', 1)[1]
-        except:
+        if not subdomains:
             # TLD directly requested
             todo()
             self.finish()
             return
         
-        protocol = b'https' if self.isSecure() else b'http'
-        port = self.ports[protocol]
-        # TODO handle custom ports somehow
-        
+        # Redirect ICANN TLDs to their normal URLs
         if tld not in OPENNIC_TLDS:
-            # (Permanently) redirect to the normal url
-            # self.setResponseCode(http.MOVED_PERMANENTLY)
             self.setResponseCode(http.FOUND)
-            port_bytes = b':%d' % port if port != self.ports[protocol] else b''
-            url = b''.join([protocol, b'://', host, port_bytes, self.uri])
+            port_bytes = b':%d' % (port) if port is not None else b''
+            url = b''.join([protocol, b'://', domain, port_bytes, self.uri])
             self.setHeader(b"location", url)
             self.finish()
             return
+        
+        # Prevent hotlinking (naive implementation)
+        if self.uri.lower().endswith(tuple(self.config.block_hotlink_exts)):
+            for referer in self.requestHeaders.getRawHeaders(b'referer', []):
+                if domain not in referer.lower():
+                    self.sendError(403)
+                    return
 
         # Rewrite headers
         headers = self.requestHeaders.copy()
-        headers.setRawHeaders(b'host', [host])
+        headers.setRawHeaders(b'host', [domain])
         headers.addRawHeader(b'via', b'Opennic2Web')
 
         self.content.seek(0, 0)
         data = self.content.read()
 
+        protocol = b'https' if self.isSecure() else b'http'
+        conn_port = port if port is not None else self.ports[protocol]
+
         clientFactory = self.protocols[protocol](
             self.method, self.uri, self.clientproto,
             headers, data, self
         )
-        self.reactor.connectTCP(host, port, clientFactory)
+        self.reactor.connectTCP(domain, conn_port, clientFactory)
         # The client will call .finish() for us
 
 
@@ -234,6 +293,6 @@ class Opennic2WebFactory(http.HTTPFactory):
     protocol = _configuredOpennic2WebFactory
 
     # TODO add default config ?
-    def __init__(self, config):
+    def __init__(self, config=Config()):
         super().__init__()
         self.config = config

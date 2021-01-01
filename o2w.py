@@ -5,15 +5,12 @@
 
 import logging
 from twisted.internet import reactor
-from opennic2web import Opennic2WebFactory
-
-class struct: pass
-config = struct()
-config.hostname = b"localhost"
+from opennic2web import Opennic2WebFactory, Config
 
 logging.basicConfig(level = logging.DEBUG, format = '%(levelname)s %(filename)s:%(lineno)d %(message)s')
 
 # TODO use twisted endpoints cf. <https://twistedmatrix.com/documents/current/core/howto/endpoints.html>
+config = Config(hostname = b'localhost')
 reactor.listenTCP(8080, Opennic2WebFactory(config=config))
 
 print("Ready")
