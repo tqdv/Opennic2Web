@@ -4,12 +4,25 @@
 # Copyright © 2021 Tilwa Qendov
 
 import logging
-from twisted.internet import reactor
+import argparse
+
 from opennic2web import Opennic2WebFactory, Config
 
-logging.basicConfig(level = logging.DEBUG, format = '%(levelname)s %(filename)s:%(lineno)d %(message)s')
+from twisted.internet import reactor
+from twisted.logger import globalLogPublisher, STDLibLogObserver
 
-# TODO use twisted endpoints cf. <https://twistedmatrix.com/documents/current/core/howto/endpoints.html>
+# === Parse command-line arguments
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--twisted", help="Turn on twisted logging")
+args = parser.parse_args()
+
+
+logging.basicConfig(level = logging.DEBUG, format = '%(levelname)s %(filename)s:%(lineno)d | %(message)s')
+if args.twisted:
+	globalLogPublisher.addObserver(STDLibLogObserver())
+
+# TODO use twisted endpoints cf. <https://twistedmatrix.com/documents/current/core/howto/endpoints.html> ... maybe ?
 config = Config(hostname = b'localhost')
 reactor.listenTCP(8080, Opennic2WebFactory(config=config))
 
