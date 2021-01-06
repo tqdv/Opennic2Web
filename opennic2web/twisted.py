@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright © 2021 Tilwa Qendov
 
-# TODO Allow streaming the OpenNIC response to the client cf. CopyBodyProducer and maybe .endHeaders to early redirect
+# TODO Allow streaming the OpenNIC response to the client cf. CopyBodyProducer
+#      and maybe .endHeaders to early redirect
 # TODO add banner
 # TODO redirect to the actual OpenNIC domain with Javascript
 # TODO check if the client is a crawler
@@ -19,7 +20,10 @@
 # Debugging
 import logging
 
-from .opennic2web import OPENNIC_TLDS, parse_o2w_hostname
+import re
+import zlib
+
+from .opennic2web import OPENNIC_TLDS, parse_o2w_hostname, o2w_re, get_o2w_hostname
 from .config import Config
 
 from twisted.web import http, client, iweb
@@ -38,7 +42,8 @@ class CopyBodyProducer:
     """
     Produce the contents of the request to the new request ie. copy it
 
-    Since we produce the body all at once, resumeProducing, pauseProducing and stopProducing do nothing.
+    Since we produce the body all at once, resumeProducing, pauseProducing
+    and stopProducing do nothing.
     """
     
     def __init__(self, request):
@@ -69,6 +74,8 @@ class CopyBodyProducer:
         pass
 
 
+# === Protocols to handle the Opennic server response ===
+
 class BodyCopyProtocol(protocol.Protocol):
     """
     Streams the response body back to the client
@@ -92,6 +99,168 @@ class BodyCopyProtocol(protocol.Protocol):
         else:
             self.deferred.errback(reason)
 
+
+class HtmlBannerProtocol(protocol.Protocol):
+    """
+    TODO edit docs, please document
+    Streams the response body back to the client
+
+    Inspired by L{client._ReadBodyProtocol}
+    """
+
+    def __init__(self, original, banner, config, bufsize=1024):
+        """
+        @param original: The protocol to wrap
+        """
+        self.original = original
+        self.banner = banner
+        self.config = config
+
+        self.bufsize = bufsize
+        self._buffer = b''
+        self.banner_inserted = False
+
+    def dataReceived(self, data):
+        # NB Although there are streaming regex engines (like intel's hyperscan),
+        #    it's just simpler to assume there's a max URL size, and use
+        #    a buffer that's larger than it
+
+        data = self._buffer + data
+
+        # Wait for enough data so we can completely replace the buffer.
+        # NB This is a bit arbitrary, but whatever
+        if not len(data) >= self.bufsize * 2:
+            # Buffer data
+            self._buffer = data
+            return
+        
+        editedData = self.editHtml(data)
+
+        # Forward the edited data, and keep a buffer
+        forwardData = editedData[:-self.bufsize]
+        self._buffer = editedData[-self.bufsize:]
+        self.original.dataReceived(forwardData)
+            
+
+    def connectionLost(self, reason):
+        # Flush buffer
+        if self._buffer:
+            editedData = self.editHtml(self._buffer)
+            # TODO Should we insert the banner if it hasn't been done yet ?
+            self.original.dataReceived(editedData)
+            self._buffer = b''
+        
+        self.original.connectionLost(reason)
+    
+    
+    def editHtml(self, data):
+        # Insert banner
+        if not self.banner_inserted:
+            data = re.sub(o2w_re['body'], lambda m: m.group(0) + self.banner, data)
+            self.banner_inserted = True
+
+        # Rewrite URLs
+        if self.config.rewrite_visible_url:
+            data = re.sub(o2w_re['o2w'], lambda m: get_o2w_hostname(m, self.config), data)
+        else:
+            data = re.sub(o2w_re['html_o2w'], lambda m: get_o2w_hostname(m, self.config), data)
+
+        return data
+
+
+# TODO what does taking in response and raising errors do ?
+class GzipDecompressor(protocol.Protocol):
+    """
+    Protocol that wraps another protocol by decompressing the input,
+    and forwarding it to the wrapper protocol
+
+    Copy pasted from L{twisted.web.client._GzipProtocol} but without the weird
+    proxyForInterface magic and actually public
+
+    @ivar _zlibDecompress: A zlib decompress object used to decompress the data
+                           stream.
+    @ivar _response: A reference to the original response, in case of errors.
+    """
+
+    def __init__(self, protocol, response):
+        self.original = protocol
+        self._response = response
+        self._zlibDecompress = zlib.decompressobj(16 + zlib.MAX_WBITS)
+
+
+    def dataReceived(self, data):
+        """
+        Decompress C{data} with the zlib decompressor, forwarding the raw data
+        to the original protocol.
+        """
+        try:
+            rawData = self._zlibDecompress.decompress(data)
+        except zlib.error:
+            raise ResponseFailed([Failure()], self._response)
+        if rawData:
+            self.original.dataReceived(rawData)
+
+
+    def connectionLost(self, reason):
+        """
+        Forward the connection lost event, flushing remaining data from the
+        decompressor if any.
+        """
+        try:
+            rawData = self._zlibDecompress.flush()
+        except zlib.error:
+            raise ResponseFailed([reason, Failure()], self._response)
+        if rawData:
+            self.original.dataReceived(rawData)
+        self.original.connectionLost(reason)
+
+
+# TODO what does taking in response and raising errors do ?
+class GzipCompressor(protocol.Protocol):
+    """
+    Protocol that wraps another protocol by compressing the input,
+    and forwarding it to the wrapper protocol
+
+    Copy pasted from L{GzipDecompresor}
+
+    @ivar _zlibCompress: A zlib compress object used to decompress the data
+                         stream.
+    @ivar _response: A reference to the original response, in case of errors.
+    """
+
+    def __init__(self, protocol, response):
+        self.original = protocol
+        self._response = response
+        self._zlibCompress = zlib.compressobj(wbits = 16 + zlib.MAX_WBITS)
+
+
+    def dataReceived(self, data):
+        """
+        Compress C{data} with the zlib compressor, forwarding the raw data
+        to the original protocol.
+        """
+        try:
+            rawData = self._zlibCompress.compress(data)
+        except zlib.error:
+            raise ResponseFailed([Failure()], self._response)
+        if rawData:
+            self.original.dataReceived(rawData)
+
+
+    def connectionLost(self, reason):
+        """
+        Forward the connection lost event, flushing remaining data from the
+        compressor if any.
+        """
+        try:
+            rawData = self._zlibCompress.flush()
+        except zlib.error:
+            raise ResponseFailed([reason, Failure()], self._response)
+        if rawData:
+            self.original.dataReceived(rawData)
+        self.original.connectionLost(reason)
+
+# ===~~~===
 
 class Opennic2WebRequest(http.Request):
     """
@@ -146,13 +315,11 @@ class Opennic2WebRequest(http.Request):
             return
         
         # Prevent hotlinking (naive implementation)
-        if self.uri.lower().endswith(tuple(self.config.block_hotlink_exts)):
-            for referer in self.requestHeaders.getRawHeaders(b'referer', []):
-                if domain not in referer.lower():
-                    self.setResponseCode(error)
-                    todo()
-                    self.finish()
-                    return
+        if self.config.should_block_hotlink(domain, self.uri, self.requestHeaders.getRawHeaders(b'referer', [])):
+            self.setResponseCode(error)
+            todo()
+            self.finish()
+            return
 
         # === Checks done, we're sending a request to the OpenNIC server ===
 
@@ -179,6 +346,7 @@ class Opennic2WebRequest(http.Request):
         
         # === Process the response ===
 
+        # Copy response headers and status code
         self.setResponseCode(response.code)
         self.responseHeaders = response.headers.copy()
         self.responseHeaders.addRawHeader(b'via', via_line)
@@ -186,34 +354,54 @@ class Opennic2WebRequest(http.Request):
         # \xe2\x86\x90 is the UTF-8 encoding of '←'
         logging.debug((b"\xe2\x86\x90 %b %b" % (self.method, url)).decode(errors='replace'))
 
-        # A Deferred that fires when the response has been completely written to the client
-        write_body = defer.Deferred()
-        body_protocol = None
+        # We create our BodyProtocol pipeline, the last one is always BodyCopy
+        # The protocols are "executed" from left to right
+        body_pipeline = []
 
-        # v TODO Should we try to handle deflate ?
-        # client.GzipDecoder
+        content_type = response.headers.getRawHeaders(b'content-type', default=[b''])[0]
+        content_encoding = [ value.strip()
+            for line in response.headers.getRawHeaders(b'content-encoding', [])
+            for value in line.split(b',') ] # TODO move to util probably
+        response_is_gzipped = [b'gzip'] == content_encoding
+
+        # TODO reduce complexity
+        if content_type:
+            # Insert banner in HTML pages
+            # NB CSS and JS (and others) can contain (absolute) URLs, but it
+            #    should be rare enough to be safe to ignore
+            if b'text/html' in content_type:
+                logging.debug(f"{self.uri.decode()} is HTML")
+
+                # Gzip decompress if it is the only compression (this is not "correct", but should be good enough)
+                # NB I know the syntax is not readable but trust me, it works
+                if response_is_gzipped:
+                    content_encoding = []
+                    body_pipeline.append(lambda x: GzipDecompressor(x, response))
+                    self.responseHeaders.removeHeader(b'content-encoding')
+                    response_is_gzipped = False
+                
+                # Modify the HTML if it's now in plaintext
+                if not content_encoding:
+                    banner = b'TODO actual banner'
+                    body_pipeline.append(lambda x: HtmlBannerProtocol(x, banner, self.config))
+
+            # Gzip compress the response based on its mime type and if the client supports it and if it's not redundant
+            if (not content_encoding
+                and b'gzip' in self.requestHeaders.getRawHeaders(b'accept-encoding', [b''])[0]
+                and self.config.should_gzip_content(content_type)):
+                    body_pipeline.append(lambda x: GzipCompressor(x, response))
+                    self.responseHeaders.addRawHeader(b'content-encoding', b'gzip')
         
-        # TODO optionally compress the response
-
-        # Insert banner in HTML pages
-        # NB CSS and JS (and others) can contain (absolute) URLs, but it
-        #    should be rare enough to be safe to ignore
-        if b'text/html' in self.responseHeaders.getRawHeaders(b'content-type', default=[b''])[0]:
-            logging.debug(f"{self.uri.decode()} is HTML")
-
-            # LEFTOF decompress if needed
-
-            # TODO actually modify the HTML (and decompress when needed)
-            body_protocol = None
-        
-        if body_protocol is None:
-            body_protocol = BodyCopyProtocol(self, write_body)
-        
-        # Send response back to client processed through body_protocol
+        # Send response back to client processed through body_pipeline
+        write_body = defer.Deferred() # fires when the response has been completely written to the client
+        body_protocol = BodyCopyProtocol(self, write_body)
+        for pipe_elt in reversed(body_pipeline):
+            body_protocol = pipe_elt(body_protocol)
         response.deliverBody(body_protocol)
         await write_body
 
-        # TODO handle failed write_body
+        # TODO handle failed write_body (and a bunch of body_protocol errors)
+        #      eg. timeout and NXDOMAINs
 
         logging.debug((b"%b %b \xe2\x86\x90" % (self.method, url)).decode(errors='replace'))
 
