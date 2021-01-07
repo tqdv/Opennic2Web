@@ -6,7 +6,6 @@
 # TODO add banner
 # TODO redirect to the actual OpenNIC domain with Javascript
 # TODO check if the client is a crawler
-# TODO gzip responses if we can (on certain mimetypes ?)
 # TODO maybe add stats
 # TODO add blocklist
 # TODO recommend DNS over TLS or DNS over HTTPS
@@ -260,7 +259,7 @@ class GzipCompressor(protocol.Protocol):
             self.original.dataReceived(rawData)
         self.original.connectionLost(reason)
 
-# ===~~~===
+# ===...===
 
 class Opennic2WebRequest(http.Request):
     """
@@ -332,7 +331,7 @@ class Opennic2WebRequest(http.Request):
         # The Content-Length header is handled by agent through body_producer
         # TODO Transfer-Encoding ? what about them ? cf. T2W
 
-        # \xe2\x86\x92 is the UTF-8 encoding of '→' 
+        # NB \xe2\x86\x92 is the UTF-8 encoding of '→' 
         logging.debug((
             b"[%b] \xe2\x86\x92 %b %b" % (self.getRequestHostname(), self.method, url)
         ).decode(errors='replace'))
@@ -351,7 +350,7 @@ class Opennic2WebRequest(http.Request):
         self.responseHeaders = response.headers.copy()
         self.responseHeaders.addRawHeader(b'via', via_line)
 
-        # \xe2\x86\x90 is the UTF-8 encoding of '←'
+        # NB \xe2\x86\x90 is the UTF-8 encoding of '←'
         logging.debug((b"\xe2\x86\x90 %b %b" % (self.method, url)).decode(errors='replace'))
 
         # We create our BodyProtocol pipeline, the last one is always BodyCopy
@@ -359,38 +358,36 @@ class Opennic2WebRequest(http.Request):
         body_pipeline = []
 
         content_type = response.headers.getRawHeaders(b'content-type', default=[b''])[0]
+        # NB I know the syntax is not readable but trust me, it works
         content_encoding = [ value.strip()
             for line in response.headers.getRawHeaders(b'content-encoding', [])
             for value in line.split(b',') ] # TODO move to util probably
         response_is_gzipped = [b'gzip'] == content_encoding
 
-        # TODO reduce complexity
-        if content_type:
-            # Insert banner in HTML pages
-            # NB CSS and JS (and others) can contain (absolute) URLs, but it
-            #    should be rare enough to be safe to ignore
-            if b'text/html' in content_type:
-                logging.debug(f"{self.uri.decode()} is HTML")
+        # Insert banner in HTML pages
+        # NB CSS and JS (and others) can contain (absolute) URLs, but it
+        #    should be rare enough to be safe to ignore
+        if content_type and b'text/html' in content_type:
+            logging.debug(f"{self.uri.decode()} is HTML")
 
-                # Gzip decompress if it is the only compression (this is not "correct", but should be good enough)
-                # NB I know the syntax is not readable but trust me, it works
-                if response_is_gzipped:
-                    content_encoding = []
-                    body_pipeline.append(lambda x: GzipDecompressor(x, response))
-                    self.responseHeaders.removeHeader(b'content-encoding')
-                    response_is_gzipped = False
-                
-                # Modify the HTML if it's now in plaintext
-                if not content_encoding:
-                    banner = b'TODO actual banner'
-                    body_pipeline.append(lambda x: HtmlBannerProtocol(x, banner, self.config))
+            # Gzip decompress if it is the only compression (this is not "correct", but should be good enough)
+            if response_is_gzipped:
+                content_encoding = []
+                body_pipeline.append(lambda x: GzipDecompressor(x, response))
+                self.responseHeaders.removeHeader(b'content-encoding')
+                response_is_gzipped = False
+            
+            # Modify the HTML if it's now in plaintext
+            if not content_encoding:
+                banner = b'TODO actual banner'
+                body_pipeline.append(lambda x: HtmlBannerProtocol(x, banner, self.config))
 
-            # Gzip compress the response based on its mime type and if the client supports it and if it's not redundant
-            if (not content_encoding
-                and b'gzip' in self.requestHeaders.getRawHeaders(b'accept-encoding', [b''])[0]
-                and self.config.should_gzip_content(content_type)):
-                    body_pipeline.append(lambda x: GzipCompressor(x, response))
-                    self.responseHeaders.addRawHeader(b'content-encoding', b'gzip')
+        # Gzip compress the response based on its mime type and if the client supports it and if it's not redundant
+        if (content_type and not content_encoding
+        and b'gzip' in self.requestHeaders.getRawHeaders(b'accept-encoding', [b''])[0]
+        and self.config.should_gzip_content(content_type)):
+            body_pipeline.append(lambda x: GzipCompressor(x, response))
+            self.responseHeaders.addRawHeader(b'content-encoding', b'gzip')
         
         # Send response back to client processed through body_pipeline
         write_body = defer.Deferred() # fires when the response has been completely written to the client
