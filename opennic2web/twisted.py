@@ -3,9 +3,7 @@
 
 # TODO Allow streaming the OpenNIC response to the client cf. CopyBodyProducer
 #      and maybe .endHeaders to early redirect
-# TODO add banner
 # TODO redirect to the actual OpenNIC domain with Javascript
-# TODO check if the client is a crawler
 # TODO maybe add stats
 # TODO add blocklist
 # TODO recommend DNS over TLS or DNS over HTTPS
@@ -299,6 +297,14 @@ class Opennic2WebRequest(http.Request):
         if not subdomains:
             # TLD directly requested
             todo()
+            self.setResponseCode(http.NOT_FOUND)
+            self.finish()
+            return
+
+        # Prevent indexing a proxied page
+        if self.uri == b'/robots.txt':
+            self.responseHeaders.addRawHeader(b'content-type', b'text/plain')
+            self.write(b'User-agent: *\nDisallow: /\n')
             self.finish()
             return
         
@@ -379,6 +385,7 @@ class Opennic2WebRequest(http.Request):
                 content_encoding = []
                 body_pipeline.append(lambda x: GzipDecompressor(x, response))
                 self.responseHeaders.removeHeader(b'content-encoding')
+                self.responseHeaders.removeHeader(b'content-length')
                 response_is_gzipped = False
             
             # Modify the HTML if it's now in plaintext
