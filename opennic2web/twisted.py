@@ -287,7 +287,8 @@ class Opennic2WebRequest(http.Request):
         defer.ensureDeferred(self.asyncProcess())
     
     async def asyncProcess(self):
-        (domain, subdomains, tld, port) = parse_o2w_hostname(self.getRequestHostname(), self.config)
+        hostname = self.getRequestHostname()
+        (domain, subdomains, tld, port) = parse_o2w_hostname(hostname, self.config)
 
         if not domain:
             # No subdomain requested
@@ -323,17 +324,22 @@ class Opennic2WebRequest(http.Request):
         # === Checks done, we're sending a request to the OpenNIC server ===
 
         via_line = self.clientproto + b' Opennic2Web'
+        forwarded_line = b'by=%b;for=_hidden;host=%b;proto=%b' % (self.config.hostname, hostname, protocol)
 
         # Rewrite headers
         headers = self.requestHeaders.copy()
         headers.setRawHeaders(b'host', [domain + port_suffix])
+        # Add forwarding headers
         headers.addRawHeader(b'via', via_line)
+        headers.addRawHeader(b'x-forwarded-host', hostname)
+        headers.addRawHeader(b'x-forwarded-proto', protocol)
+        headers.addRawHeader(b'forwarded', forwarded_line)
         # The Content-Length header is handled by agent through body_producer
         # TODO Transfer-Encoding ? what about them ? cf. T2W
 
         # NB \xe2\x86\x92 is the UTF-8 encoding of '→' 
         logging.debug((
-            b"[%b] \xe2\x86\x92 %b %b" % (self.getRequestHostname(), self.method, url)
+            b"[%b] \xe2\x86\x92 %b %b" % (hostname, self.method, url)
         ).decode(errors='replace'))
 
         # TODO Do we need to implement EndpointFactory or something cf. T2W
@@ -368,8 +374,6 @@ class Opennic2WebRequest(http.Request):
         # NB CSS and JS (and others) can contain (absolute) URLs, but it
         #    should be rare enough to be safe to ignore
         if content_type and b'text/html' in content_type:
-            logging.debug(f"{self.uri.decode()} is HTML")
-
             # Gzip decompress if it is the only compression (this is not "correct", but should be good enough)
             if response_is_gzipped:
                 content_encoding = []
@@ -379,8 +383,7 @@ class Opennic2WebRequest(http.Request):
             
             # Modify the HTML if it's now in plaintext
             if not content_encoding:
-                banner = b'TODO actual banner'
-                body_pipeline.append(lambda x: HtmlBannerProtocol(x, banner, self.config))
+                body_pipeline.append(lambda x: HtmlBannerProtocol(x, self.channel.factory.banner, self.config))
 
         # Gzip compress the response based on its mime type and if the client supports it and if it's not redundant
         if (content_type and not content_encoding
@@ -449,3 +452,5 @@ class Opennic2WebFactory(http.HTTPFactory):
         super().__init__()
         self.config = config
         self.http_pool = client.HTTPConnectionPool(reactor)
+        with open('templates/banner.xml', 'rb') as f:
+            self.banner = f.read()
