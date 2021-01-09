@@ -9,6 +9,7 @@ import argparse
 from opennic2web import Opennic2WebFactory, Config
 
 from twisted.internet import reactor
+from twisted.internet.endpoints import serverFromString
 from twisted.logger import globalLogPublisher, STDLibLogObserver
 
 # === Parse command-line arguments
@@ -22,9 +23,14 @@ logging.basicConfig(level = logging.DEBUG, format = '%(levelname)s %(filename)s:
 if args.twisted:
 	globalLogPublisher.addObserver(STDLibLogObserver())
 
-# TODO use twisted endpoints cf. <https://twistedmatrix.com/documents/current/core/howto/endpoints.html> ... maybe ?
 config = Config(hostname = b'localhost')
-reactor.listenTCP(8080, Opennic2WebFactory(config=config))
+factory = Opennic2WebFactory(config=config)
+
+http_server = serverFromString(reactor, 'tcp:8080')
+http_server.listen(factory)
+
+#https_server = serverFromString(reactor, 'ssl:8443:privateKey=key.pem:certKey=crt.pem')
+#https_server.listen(factory)
 
 print("Ready")
 reactor.run()

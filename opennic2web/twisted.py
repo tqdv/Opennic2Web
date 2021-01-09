@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright © 2021 Tilwa Qendov
 
-# TODO Allow streaming the OpenNIC response to the client cf. CopyBodyProducer
-#      and maybe .endHeaders to early redirect
 # TODO redirect to the actual OpenNIC domain with Javascript
 # TODO maybe add stats
 # TODO add blocklist
@@ -20,7 +18,7 @@ import logging
 import re
 import zlib
 
-from .opennic2web import OPENNIC_TLDS, parse_o2w_hostname, o2w_re, get_o2w_hostname
+from .opennic2web import OPENNIC_TLDS, parse_o2w_hostname, o2w_re, get_o2w_hostname, get_w2o_hostname
 from .config import Config
 
 from twisted.web import http, client, iweb
@@ -285,19 +283,29 @@ class Opennic2WebRequest(http.Request):
         defer.ensureDeferred(self.asyncProcess())
     
     async def asyncProcess(self):
+        # === Check if we should proxy the request ===
+
         hostname = self.getRequestHostname()
         (domain, subdomains, tld, port) = parse_o2w_hostname(hostname, self.config)
 
         if not domain:
             # No subdomain requested
-            todo()
+            self.setResponseCode(http.NOT_IMPLEMENTED) # FIXME
+            # TODO serve homepage
             self.finish()
             return
 
         if not subdomains:
             # TLD directly requested
-            todo()
             self.setResponseCode(http.NOT_FOUND)
+            # TODO add html body
+            self.finish()
+            return
+        
+        # Reject blocked domains
+        if self.config.should_block_domain(domain):
+            self.setResponseCode(http.FORBIDDEN)
+            # TODO display blocked domain html
             self.finish()
             return
 
@@ -321,13 +329,14 @@ class Opennic2WebRequest(http.Request):
             return
         
         # Prevent hotlinking (naive implementation)
-        if self.config.should_block_hotlink(domain, self.uri, self.requestHeaders.getRawHeaders(b'referer', [])):
-            self.setResponseCode(error)
-            todo()
+        origin_line = self.requestHeaders.getRawHeaders(b'origin', [b''])[0]
+        if self.config.should_block_hotlink(domain, self.uri, origin_line):
+            self.setResponseCode(http.FORBIDDEN)
+            # TODO add html body
             self.finish()
             return
 
-        # === Checks done, we're sending a request to the OpenNIC server ===
+        # === Checks done, we're sending a request to the "OpenNIC server" ===
 
         via_line = self.clientproto + b' Opennic2Web'
         forwarded_line = b'by=%b;for=_hidden;host=%b;proto=%b' % (self.config.hostname, hostname, protocol)
@@ -335,22 +344,29 @@ class Opennic2WebRequest(http.Request):
         # Rewrite headers
         headers = self.requestHeaders.copy()
         headers.setRawHeaders(b'host', [domain + port_suffix])
+        referer_line = headers.getRawHeaders(b'referer', [None])[0]
+        if referer_line is not None:
+            new_referer = re.sub(self.config.re_header_w2o, lambda m: get_w2o_hostname(m), referer_line)
+            headers.setRawHeaders(b'referer', [new_referer])
+        origin_line = headers.getRawHeaders(b'origin', [None])[0]
+        if origin_line is not None:
+            new_origin = re.sub(self.config.re_header_w2o, lambda m: get_w2o_hostname(m), origin_line)
+            headers.setRawHeaders(b'origin', [new_origin])
+
         # Add forwarding headers
         headers.addRawHeader(b'via', via_line)
         headers.addRawHeader(b'x-forwarded-host', hostname)
         headers.addRawHeader(b'x-forwarded-proto', protocol)
         headers.addRawHeader(b'forwarded', forwarded_line)
         # The Content-Length header is handled by agent through body_producer
-        # TODO Transfer-Encoding ? what about them ? cf. T2W
 
         # NB \xe2\x86\x92 is the UTF-8 encoding of '→' 
         logging.debug((
             b"[%b] \xe2\x86\x92 %b %b" % (hostname, self.method, url)
         ).decode(errors='replace'))
 
-        # TODO Do we need to implement EndpointFactory or something cf. T2W
         # Create our Agent and send the request
-        agent = client.Agent(self.reactor) # pool=self.http_pool
+        agent = client.Agent(self.reactor, pool=self.http_pool)
         response = await agent.request(self.method, url, headers=headers, bodyProducer=CopyBodyProducer(self))
 
         # TODO handle failed request
@@ -361,6 +377,13 @@ class Opennic2WebRequest(http.Request):
         self.setResponseCode(response.code)
         self.responseHeaders = response.headers.copy()
         self.responseHeaders.addRawHeader(b'via', via_line)
+
+        # Rewrite headers
+        location_line = self.responseHeaders.getRawHeaders(b'location', [None])[0]
+        if location_line is not None:
+            new_location = re.sub(o2w_re['header_o2w'], lambda m: get_o2w_hostname(m, self.config), location_line)
+            self.responseHeaders.setRawHeaders(b'location', [new_location])
+        # TODO rewrite CORS header
 
         # NB \xe2\x86\x90 is the UTF-8 encoding of '←'
         logging.debug((b"\xe2\x86\x90 %b %b" % (self.method, url)).decode(errors='replace'))
@@ -455,9 +478,13 @@ class Opennic2WebFactory(http.HTTPFactory):
 
     protocol = _configured_and_pooledOpennic2WebFactory
 
-    def __init__(self, config=Config(), reactor=reactor):
+    def __init__(self, config=None, reactor=reactor):
+        if config is None:
+            raise ValueError("Missing configuration")
+
         super().__init__()
         self.config = config
         self.http_pool = client.HTTPConnectionPool(reactor)
+        # TODO refactor path to config
         with open('templates/banner.xml', 'rb') as f:
             self.banner = f.read()

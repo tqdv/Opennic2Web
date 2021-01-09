@@ -57,7 +57,7 @@ def parse_o2w_hostname(host, config):
     return (domain, subdomains, tld, port)
 
 
-# TODO add custom port (but how to differentiate HTTP and HTTPS ports ?)
+# TODO add custom port for the O2W server (but how to differentiate HTTP and HTTPS ports ?)
 def get_o2w_hostname(match, config):
     """
     Return the translated Opennic2Web url from the o2w regex match.
@@ -67,6 +67,16 @@ def get_o2w_hostname(match, config):
     port = b'.' + port if port else b''
 
     return match.group(1) + port + b'.' + config.hostname
+
+
+def get_w2o_hostname(match):
+    """
+    Replace an Opennic2Web url to its Opennic counterpart. Used by the Config.re_header_w2o regex.
+    """
+    port = match.group(3)
+    port = b':' + port if port else b''
+
+    return match.group(1) + port
 
 
 o2w_re = {
@@ -79,7 +89,8 @@ o2w_re = {
         (
             # (?: http: | https: )?         # Protocol
             //
-            (?= (?P<subdomains> (?: [a-zA-Z0-9-]{1,63} \. )+ ) ) (?P=subdomains) # Non-backtracking Subdomains $2
+            # Non-backtracking Subdomains $2
+            (?= (?P<subdomains> (?: [a-zA-Z0-9-]{1,63} \. )+ ) ) (?P=subdomains)
             (?: ''' + OPENNIC_TLDS_RE + rb''' ) # TLD
         )                                # Domain name $1
         (?= . ) (?! \. | [a-zA-Z0-9-] )  # Not an incomplete subdomain or label
@@ -91,10 +102,22 @@ o2w_re = {
             = ['"]?
             (?: http: | https: )?        # Protocol
             //
-            (?= (?P<subdomains> (?: [a-zA-Z0-9-]{1,63} \. )+ ) ) (?P=subdomains) # Non-backtracking Subdomains $2
+            # Non-backtracking Subdomains $2
+            (?= (?P<subdomains> (?: [a-zA-Z0-9-]{1,63} \. )+ ) ) (?P=subdomains)
             (?: ''' + OPENNIC_TLDS_RE + rb''' ) # TLD
         )                                # Domain name (and prefix) $1
         (?= . ) (?! \. | [a-zA-Z0-9-] )  # Not an incomplete subdomain or label
         (?: : (\d{1,5}) (?= [\ '"/] ) )? # Full Port number $3?
+        ''', re.X),
+    # Variant of o2w that assumes it is the whole string
+    'header_o2w': re.compile(rb'''
+        (
+            //
+            # Non-backtracking Subdomains $2
+            (?= (?P<subdomains> (?: [a-zA-Z0-9-]{1,63} \. )+ ) ) (?P=subdomains)
+            (?: ''' + OPENNIC_TLDS_RE + rb''' ) # TLD
+        )                           # Domain name $1
+        (?! \. | [a-zA-Z0-9-] )     # Not an incomplete subdomain or label
+        (?: : (\d{1,5}) )? (?! \d ) # Full Port number $3?
         ''', re.X),
 }
